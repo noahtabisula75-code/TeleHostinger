@@ -7,8 +7,7 @@ import path from "path";
 import multer from "multer";
 import fs from "fs";
 import { spawn, ChildProcess } from "child_process";
-import AdmZip from "adm-zip";
-import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
 
 // Global error handlers to prevent process crashes
 process.on('uncaughtException', (err) => {
@@ -25,6 +24,11 @@ if (!fs.existsSync(projectsDir)) {
   fs.mkdirSync(projectsDir);
 }
 
+// Supabase Setup
+const supabaseUrl = process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 interface ProjectMetadata {
   id: string;
   name: string;
@@ -35,8 +39,6 @@ interface ProjectMetadata {
   isLiked?: boolean;
   status?: "offline" | "online" | "starting";
   startedAt?: string;
-  userId?: string;
-  githubUrl?: string;
 }
 
 // In-memory state for running processes
@@ -48,91 +50,113 @@ interface ProjectState {
 
 const projectStates = new Map<string, ProjectState>();
 
-const ADMIN_CREDENTIALS = {
-  username: "TeleHostAdmin123",
-  password: "TeleHostAdmin@2011#"
-};
-
-const PLANS = {
-  default: { maxProjects: 3, storageGB: 0.5 },
-  starter: { maxProjects: 5, storageGB: 1 },
-  pro: { maxProjects: 10, storageGB: 3 },
-  ultra: { maxProjects: 15, storageGB: 5 }
-};
-
-interface UserProfile {
-  id: string;
-  username: string;
-  password?: string;
-  plan: string;
-  createdAt: string;
-}
-
-async function getUsers(): Promise<UserProfile[]> {
-  const usersFile = path.join(process.cwd(), "users.json");
-  if (!fs.existsSync(usersFile)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(usersFile, "utf8"));
-  } catch {
-    return [];
-  }
-}
-
-async function saveUsers(users: UserProfile[]) {
-  const usersFile = path.join(process.cwd(), "users.json");
-  fs.writeFileSync(usersFile, JSON.stringify(users, null, 2));
-}
-
-async function getUserPlan(userId: string): Promise<string> {
-  const users = await getUsers();
-  const user = users.find(u => u.id === userId);
-  return user?.plan || "default";
-}
-
-async function setUserPlan(userId: string, plan: string) {
-  const users = await getUsers();
-  const index = users.findIndex(u => u.id === userId);
-  if (index >= 0) {
-    users[index].plan = plan;
-    await saveUsers(users);
-  }
-}
-
-// Local Storage Setup
-const projectsFile = path.join(process.cwd(), "projects.json");
-
 async function getProjects(): Promise<ProjectMetadata[]> {
-  if (!fs.existsSync(projectsFile)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(projectsFile, "utf8"));
-  } catch (err) {
-    console.error("Error reading projects.json:", err);
+  if (!supabaseUrl || !supabaseKey) {
+    console.warn("Supabase not configured, falling back to local projects.json");
+    const projectsFile = path.join(process.cwd(), "projects.json");
+    if (!fs.existsSync(projectsFile)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(projectsFile, "utf8"));
+    } catch {
+      return [];
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('projects')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error("Supabase error fetching projects:", error);
     return [];
   }
+
+  return data.map(p => ({
+    id: p.id,
+    name: p.name,
+    type: p.type,
+    token: p.token,
+    mainScript: p.main_script,
+    createdAt: p.created_at,
+    isLiked: p.is_liked,
+    status: p.status,
+    startedAt: p.started_at
+  }));
 }
 
 async function saveProject(project: ProjectMetadata) {
-  const projects = await getProjects();
-  const index = projects.findIndex(p => p.id === project.id);
-  if (index >= 0) {
-    projects[index] = project;
-  } else {
-    projects.push(project);
-  }
-  try {
+  if (!supabaseUrl || !supabaseKey) {
+    const projectsFile = path.join(process.cwd(), "projects.json");
+    const projects = await getProjects();
+    const index = projects.findIndex(p => p.id === project.id);
+    if (index >= 0) projects[index] = project;
+    else projects.push(project);
     fs.writeFileSync(projectsFile, JSON.stringify(projects, null, 2));
+    return;
+  }
+
+  const { error } = await supabase
+    .from('projects')
+    .upsert({
+      id: project.id,
+      name: project.name,
+      type: project.type,
+      token: project.token,
+      main_script: project.mainScript,
+      created_at: project.createdAt,
+      is_liked: project.isLiked,
+      status: project.status,
+      started_at: project.startedAt
+    });
+
+  if (error) console.error("Supabase error saving project:", error);
+}
+
+async function uploadToSupabase(projectId: string, fileName: string, filePath: string) {
+  if (!supabaseUrl || !supabaseKey) return;
+  try {
+    const fileBuffer = fs.readFileSync(filePath);
+    const { error } = await supabase.storage
+      .from('project-files')
+      .upload(`${projectId}/${fileName}`, fileBuffer, {
+        upsert: true,
+        contentType: fileName.endsWith('.py') ? 'text/x-python' : 'application/javascript'
+      });
+    if (error) console.error(`[supabase-storage] Upload error for ${fileName}:`, error);
+    else console.log(`[supabase-storage] Synced ${fileName} to cloud`);
   } catch (err) {
-    console.error("Error saving projects.json:", err);
+    console.error(`[supabase-storage] Failed to sync ${fileName}:`, err);
   }
 }
 
-// Disable Supabase storage sync as we'll use local storage only
-async function uploadToSupabase() {
-  // No-op: Using local storage only
-}
+async function downloadFromSupabase(projectId: string) {
+  if (!supabaseUrl || !supabaseKey) return;
+  try {
+    const { data: files, error: listError } = await supabase.storage
+      .from('project-files')
+      .list(projectId);
+    
+    if (listError) throw listError;
+    if (!files || files.length === 0) return;
 
-async function downloadFromSupabase() {
-  // No-op: Using local storage only
+    const dir = getProjectDir(projectId);
+    for (const file of files) {
+      const localPath = path.join(dir, file.name);
+      if (fs.existsSync(localPath)) continue;
+
+      console.log(`[supabase-storage] Downloading ${file.name}...`);
+      const { data, error: downloadError } = await supabase.storage
+        .from('project-files')
+        .download(`${projectId}/${file.name}`);
+      
+      if (downloadError) throw downloadError;
+      const buffer = Buffer.from(await data.arrayBuffer());
+      fs.writeFileSync(localPath, buffer);
+    }
+  } catch (err) {
+    console.error(`[supabase-storage] Sync down failed for ${projectId}:`, err);
+  }
 }
 
 function getProjectDir(projectId: string) {
@@ -241,7 +265,7 @@ async function startServer() {
   const launchProject = async (id: string) => {
     try {
       // Sync files down from Supabase first (for free hosting persistence)
-      await downloadFromSupabase();
+      await downloadFromSupabase(id);
 
       const projects = await getProjects();
       const project = projects.find(p => p.id === id);
@@ -371,28 +395,15 @@ async function startServer() {
 
   app.post("/api/projects", async (req, res) => {
     try {
-      const { name, type, userId } = req.body;
-      if (!name || !type || !userId) return res.status(400).json({ error: "Name, type, and userId required" });
+      const { name, type } = req.body;
+      if (!name || !type) return res.status(400).json({ error: "Name and type required" });
       
-      const projects = await getProjects();
-      const userProjects = projects.filter(p => p.userId === userId);
-      const userPlan = await getUserPlan(userId);
-      const limit = PLANS[userPlan as keyof typeof PLANS]?.maxProjects || PLANS.default.maxProjects;
-
-      if (userProjects.length >= limit) {
-        return res.status(403).json({ 
-          error: `Project limit reached. Your current plan (${userPlan}) allows up to ${limit} projects.`,
-          limitReached: true
-        });
-      }
-
       const newProject: ProjectMetadata = {
         id: Math.random().toString(36).substr(2, 9),
         name,
         type,
         createdAt: new Date().toISOString(),
-        isLiked: false,
-        userId
+        isLiked: false
       };
       
       await saveProject(newProject);
@@ -439,8 +450,14 @@ async function startServer() {
       }
       projectStates.delete(id);
 
-      const updatedProjects = projects.filter(p => p.id !== id);
-      fs.writeFileSync(projectsFile, JSON.stringify(updatedProjects, null, 2));
+      if (supabaseUrl && supabaseKey) {
+        const { error } = await supabase.from('projects').delete().eq('id', id);
+        if (error) console.error("Supabase error deleting project:", error);
+      } else {
+        const updatedProjects = projects.filter(p => p.id !== id);
+        const projectsFile = path.join(process.cwd(), "projects.json");
+        fs.writeFileSync(projectsFile, JSON.stringify(updatedProjects, null, 2));
+      }
       
       const projectDir = getProjectDir(id);
       if (fs.existsSync(projectDir)) {
@@ -522,9 +539,12 @@ async function startServer() {
       const requirementsFile = files?.requirements?.[0];
       const extraFiles = files?.extraFiles || [];
 
-      if (scriptFile) await uploadToSupabase();
-      if (requirementsFile) await uploadToSupabase();
-      await Promise.all(extraFiles.map(() => uploadToSupabase()));
+      const dir = getProjectDir(id);
+      if (scriptFile) await uploadToSupabase(id, scriptFile.originalname, path.join(dir, scriptFile.originalname));
+      if (requirementsFile) await uploadToSupabase(id, requirementsFile.originalname, path.join(dir, requirementsFile.originalname));
+      for (const f of extraFiles) {
+        await uploadToSupabase(id, f.originalname, path.join(dir, f.originalname));
+      }
 
       if (scriptFile) console.log(`[deploy] Script file uploaded: ${scriptFile.originalname}`);
       if (requirementsFile) console.log(`[deploy] Requirements file uploaded: ${requirementsFile.originalname}`);
@@ -578,77 +598,9 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  app.post("/api/projects/:id/github-import", async (req, res) => {
+  app.get("/api/projects/:id/files", (req, res) => {
     try {
-      const { id } = req.params;
-      const { githubUrl } = req.body;
-      if (!githubUrl) return res.status(400).json({ error: "GitHub URL required" });
-
-      const projects = await getProjects();
-      const project = projects.find(p => p.id === id);
-      if (!project) return res.status(404).json({ error: "Project not found" });
-
-      // Parse GitHub URL to get zip download link
-      // Example: https://github.com/user/repo -> https://github.com/user/repo/archive/refs/heads/main.zip
-      let zipUrl = githubUrl.replace(/\/$/, "");
-      if (!zipUrl.endsWith(".zip")) {
-        zipUrl = `${zipUrl}/archive/refs/heads/main.zip`;
-      }
-
-      io.to(id).emit("log", { projectId: id, type: "info", message: `Importing from GitHub: ${githubUrl}...` });
-
-      const response = await axios.get(zipUrl, { responseType: "arraybuffer" });
-      const zip = new AdmZip(Buffer.from(response.data));
-      const projectDir = getProjectDir(id);
-
-      // Extract to a temporary directory first to handle the top-level folder in the zip
-      const tempDir = path.join(projectDir, "_temp_import");
-      if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
-      zip.extractAllTo(tempDir, true);
-
-      // Move files from the extracted top-level folder to projectDir
-      const extractedFolders = fs.readdirSync(tempDir);
-      if (extractedFolders.length > 0) {
-        const topFolder = path.join(tempDir, extractedFolders[0]);
-        if (fs.statSync(topFolder).isDirectory()) {
-          const files = fs.readdirSync(topFolder);
-          for (const file of files) {
-            const src = path.join(topFolder, file);
-            const dest = path.join(projectDir, file);
-            if (fs.existsSync(dest)) {
-              if (fs.statSync(dest).isDirectory()) {
-                fs.rmSync(dest, { recursive: true, force: true });
-              } else {
-                fs.unlinkSync(dest);
-              }
-            }
-            fs.renameSync(src, dest);
-          }
-        }
-      }
-
-      fs.rmSync(tempDir, { recursive: true, force: true });
-
-      project.githubUrl = githubUrl;
-      await saveProject(project);
-
-      io.to(id).emit("log", { projectId: id, type: "success", message: "GitHub import successful!" });
-      res.json({ success: true });
-    } catch (err: unknown) {
-      console.error("GitHub import error:", err);
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `GitHub import failed: ${message}` });
-    }
-  });
-
-  app.get("/api/projects/:id/files", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const projects = await getProjects();
-      const project = projects.find(p => p.id === id);
-      if (!project) return res.status(404).json({ error: "Project not found" });
-
-      const dir = getProjectDir(id);
+      const dir = getProjectDir(req.params.id);
       const files = fs.readdirSync(dir);
       const details = files.map(f => {
         const s = fs.statSync(path.join(dir, f));
@@ -671,104 +623,12 @@ async function startServer() {
     res.download(filePath);
   });
 
-  // Auth Routes
-  app.post("/api/auth/signup", async (req, res) => {
-    try {
-      const { username, password } = req.body;
-      if (!username || !password) return res.status(400).json({ error: "Username and password required" });
-      
-      const users = await getUsers();
-      if (users.find(u => u.username === username) || username === ADMIN_CREDENTIALS.username) {
-        return res.status(400).json({ error: "Username already exists" });
-      }
-
-      const newUser = {
-        id: Math.random().toString(36).substr(2, 9),
-        username,
-        password, // In a real app, hash this!
-        plan: "default",
-        createdAt: new Date().toISOString()
-      };
-
-      users.push(newUser);
-      await saveUsers(users);
-      
-      const userWithoutPassword = { ...newUser };
-      delete userWithoutPassword.password;
-      res.json(userWithoutPassword);
-    } catch (err) {
-      console.error("Signup error:", err);
-      res.status(500).json({ error: "Signup failed" });
-    }
-  });
-
-  app.post("/api/auth/login", async (req, res) => {
-    try {
-      const { username, password } = req.body;
-      
-      // Check Admin
-      if (username === ADMIN_CREDENTIALS.username && password === ADMIN_CREDENTIALS.password) {
-        return res.json({
-          id: "admin-id",
-          username: ADMIN_CREDENTIALS.username,
-          isAdmin: true,
-          plan: "ultra"
-        });
-      }
-
-      const users = await getUsers();
-      const user = users.find(u => u.username === username && u.password === password);
-      
-      if (!user) return res.status(401).json({ error: "Invalid credentials" });
-
-      const userWithoutPassword = { ...user };
-      delete userWithoutPassword.password;
-      res.json({ ...userWithoutPassword, isAdmin: false });
-    } catch (err) {
-      console.error("Login error:", err);
-      res.status(500).json({ error: "Login failed" });
-    }
-  });
-
-  // Admin Routes
-  app.get("/api/admin/users", async (req, res) => {
-    try {
-      const users = await getUsers();
-      const usersWithPlans = users.map(u => ({
-        id: u.id,
-        username: u.username,
-        plan: u.plan
-      }));
-      res.json(usersWithPlans);
-    } catch (err) {
-      console.error("Admin fetch users error:", err);
-      res.status(500).json({ error: "Failed to fetch users" });
-    }
-  });
-
-  app.post("/api/admin/update-plan", async (req, res) => {
-    try {
-      const { userId, plan } = req.body;
-      if (!userId || !plan) return res.status(400).json({ error: "userId and plan required" });
-      if (!PLANS[plan as keyof typeof PLANS]) return res.status(400).json({ error: "Invalid plan" });
-
-      await setUserPlan(userId, plan);
-      res.json({ success: true, plan });
-    } catch (err) {
-      console.error("Admin update plan error:", err);
-      res.status(500).json({ error: "Failed to update plan" });
-    }
-  });
-
   app.all("/api/*", (req, res) => {
     res.status(404).json({ error: `API Route ${req.method} ${req.url} not found` });
   });
 
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({ 
-      server: { middlewareMode: true }, 
-      appType: "spa" 
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
