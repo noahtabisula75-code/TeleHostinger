@@ -1,5 +1,5 @@
 {
-  "name": "TeleHost - 24/7 Telegram Bot Hosting",
-  "description": "A professional dashboard to host, manage, and monitor your Telegram bots with 24/7 uptime and real-time logs.",
+  "name": "TeleHostinger",
+  "description": "A powerful Telegram bot hosting platform with Node.js and Python support, live console, and real-time management.",
   "requestFramePermissions": []
 }
