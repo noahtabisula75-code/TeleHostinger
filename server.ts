@@ -13,6 +13,7 @@ import "dotenv/config";
 import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import archiver from "archiver";
 
 const app = express();
 app.use(cookieParser());
@@ -232,36 +233,57 @@ const saveProject = async (project: any, userId: string) => {
 
 const saveFileToSupabase = async (projectId: string, fileName: string, content: string) => {
   const client = getSupabase();
-  if (!client) return;
-  await client.from("project_files").upsert({ 
+  if (!client) {
+    console.warn(`[SUPABASE] Cannot save file ${fileName}: Database not connected.`);
+    return;
+  }
+  const { error } = await client.from("project_files").upsert({ 
     project_id: projectId, 
     file_name: fileName, 
     content,
     updated_at: new Date().toISOString()
   }, { onConflict: 'project_id,file_name' });
+
+  if (error) {
+    console.error(`[SUPABASE] Error saving file ${fileName}:`, error.message);
+  } else {
+    console.log(`[SUPABASE] Successfully backed up ${fileName} for project ${projectId}`);
+  }
 };
 
 const hydrateProjectFiles = async (projectId: string) => {
   const client = getSupabase();
-  if (!client) return;
+  if (!client) {
+    console.warn(`[SUPABASE] Cannot hydrate files: Database not connected.`);
+    return false;
+  }
 
   const projectDir = path.join(PROJECTS_DIR, projectId);
   if (!fs.existsSync(projectDir)) {
     fs.mkdirSync(projectDir, { recursive: true });
   }
 
+  console.log(`[SUPABASE] Attempting to hydrate files for project ${projectId}...`);
   const { data, error } = await client
     .from("project_files")
     .select("file_name, content")
     .eq("project_id", projectId);
 
-  if (!error && data) {
+  if (error) {
+    console.error(`[SUPABASE] Error fetching files for hydration:`, error.message);
+    return false;
+  }
+
+  if (data && data.length > 0) {
     for (const file of data) {
       const filePath = path.join(projectDir, file.file_name);
       fs.writeFileSync(filePath, file.content);
+      console.log(`[SUPABASE] Restored file: ${file.file_name}`);
     }
     return true;
   }
+  
+  console.log(`[SUPABASE] No files found in database for project ${projectId}`);
   return false;
 };
 
@@ -748,6 +770,44 @@ app.get("/api/projects/:id/files", authenticateToken, async (req: any, res) => {
   }
 });
 
+app.get("/api/projects/:id/files/:filename", authenticateToken, (req: any, res) => {
+  const { id, filename } = req.params;
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
+  const filePath = path.join(PROJECTS_DIR, id, filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+  res.download(filePath);
+});
+
+app.get("/api/projects/:id/zip", authenticateToken, (req: any, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
+  const projectDir = path.join(PROJECTS_DIR, id);
+  if (!fs.existsSync(projectDir)) {
+    return res.status(404).json({ error: "Project folder not found" });
+  }
+
+  const archive = archiver("zip", {
+    zlib: { level: 9 } // Sets the compression level.
+  });
+
+  res.attachment(`${project.name.replace(/\s+/g, "_")}.zip`);
+
+  archive.on("error", (err) => {
+    res.status(500).send({ error: err.message });
+  });
+
+  archive.pipe(res);
+  archive.directory(projectDir, false);
+  archive.finalize();
+});
+
 app.patch("/api/projects/:id", authenticateToken, async (req: any, res) => {
   const { id } = req.params;
   const userId = req.user.id;
@@ -790,6 +850,55 @@ app.delete("/api/projects/:id", authenticateToken, async (req: any, res) => {
 
   projectsByUserId[userId].splice(projectIndex, 1);
   res.json({ message: "Project deleted successfully" });
+});
+
+app.post("/api/projects/:id/backup", authenticateToken, async (req: any, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
+  const client = getSupabase();
+  if (!client) return res.status(500).json({ error: "Database not connected. Please configure Supabase in .env" });
+
+  try {
+    // Save metadata
+    await saveProject(project, userId);
+
+    // Save all local files to Supabase
+    const projectDir = path.join(PROJECTS_DIR, id);
+    if (fs.existsSync(projectDir)) {
+      const files = fs.readdirSync(projectDir);
+      for (const file of files) {
+        const filePath = path.join(projectDir, file);
+        if (fs.statSync(filePath).isFile()) {
+          const content = fs.readFileSync(filePath, "utf-8");
+          await saveFileToSupabase(id, file, content);
+        }
+      }
+    }
+    res.json({ message: "Backup successful" });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/projects/:id/sync-files", authenticateToken, async (req: any, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+  const project = (projectsByUserId[userId] || []).find(p => p.id === id);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
+  try {
+    const success = await hydrateProjectFiles(id);
+    if (success) {
+      res.json({ message: "Files restored from database successfully" });
+    } else {
+      res.status(500).json({ error: "Failed to restore files. Check if you have any files in the database." });
+    }
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post("/api/projects/:id/install", authenticateToken, (req: any, res) => {
